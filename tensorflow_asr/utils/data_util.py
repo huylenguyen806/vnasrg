@@ -20,7 +20,8 @@ import tensorflow as tf
 def create_inputs(inputs: tf.Tensor,
                   inputs_length: tf.Tensor,
                   predictions: tf.Tensor = None,
-                  predictions_length: tf.Tensor = None) -> dict:
+                  predictions_length: tf.Tensor = None,
+                  mask: tf.Tensor = None) -> dict:
     data = {
         "inputs": inputs,
         "inputs_length": inputs_length,
@@ -29,6 +30,8 @@ def create_inputs(inputs: tf.Tensor,
         data["predictions"] = predictions
     if predictions_length is not None:
         data["predictions_length"] = predictions_length
+    if mask is not None:
+        data["mask"] = mask
     return data
 
 

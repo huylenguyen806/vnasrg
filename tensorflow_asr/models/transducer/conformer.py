@@ -49,6 +49,7 @@ class Conformer(Transducer):
                  joint_trainable: bool = True,
                  kernel_regularizer=L2,
                  bias_regularizer=L2,
+                 streaming=False,
                  name: str = "conformer",
                  **kwargs):
         super(Conformer, self).__init__(
@@ -67,6 +68,7 @@ class Conformer(Transducer):
                 kernel_regularizer=kernel_regularizer,
                 bias_regularizer=bias_regularizer,
                 trainable=encoder_trainable,
+                streaming=streaming,
                 name=f"{name}_encoder"
             ),
             vocabulary_size=vocabulary_size,

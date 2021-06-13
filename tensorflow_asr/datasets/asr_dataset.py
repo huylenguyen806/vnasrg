@@ -368,3 +368,284 @@ class ASRSliceDataset(ASRDataset):
         dataset = tf.data.Dataset.from_tensor_slices(self.entries)
         dataset = dataset.map(self.load, num_parallel_calls=AUTOTUNE)
         return self.process(dataset, batch_size)
+
+
+class ASRMaskedSliceDataset(ASRSliceDataset):
+    """ Dataset for ASR with rolling mask """
+
+    def __init__(self,
+                 stage: str,
+                 speech_featurizer: SpeechFeaturizer,
+                 text_featurizer: TextFeaturizer,
+                 data_paths: list,
+                 augmentations: Augmentation = Augmentation(None),
+                 cache: bool = False,
+                 shuffle: bool = False,
+                 indefinite: bool = False,
+                 drop_remainder: bool = True,
+                 use_tf: bool = False,
+                 buffer_size: int = BUFFER_SIZE,
+                 history_window_size: int = 3,
+                 input_chunk_duration: int = 250,
+                 time_reduction_factor: int = 4,
+                 **kwargs):
+        super(ASRMaskedSliceDataset, self).__init__(
+            data_paths=data_paths, augmentations=augmentations,
+            cache=cache, shuffle=shuffle, stage=stage, buffer_size=buffer_size,
+            drop_remainder=drop_remainder, use_tf=use_tf, indefinite=indefinite,
+            speech_featurizer=speech_featurizer, text_featurizer=text_featurizer
+        )
+        self.speech_featurizer = speech_featurizer
+        self.text_featurizer = text_featurizer
+        self.history_window_size = history_window_size
+        self.input_chunk_size = input_chunk_duration * self.speech_featurizer.sample_rate // 1000
+        self.time_reduction_factor = time_reduction_factor
+
+        self.base_mask = tf.constant(0, dtype=tf.int32)
+        self.use_base_mask = False
+
+        # If max input length is known, pre-compute mask
+        if self.speech_featurizer.max_length:
+            num_frames = 1 + (self.speech_featurizer.max_length - self.speech_featurizer.frame_length) // self.speech_featurizer.frame_step
+            self.base_mask = self.calculate_mask(num_frames)
+            self.use_base_mask = True
+
+    def _recalculate_mask(self, num_frames):
+        frames_per_chunk = self.input_chunk_size // self.speech_featurizer.frame_step
+
+        def _calculate_mask(num_frames, frames_per_chunk, history_window_size):
+            mask = np.zeros((num_frames, num_frames), dtype=np.int32)
+            for i in range(num_frames):
+                # Frames in the same chunk can see each other
+                # If frames in `history_window_size` are in other chunks, the full chunks are visible
+                current_chunk_index = i // frames_per_chunk
+                history_chunk_index = (i - history_window_size) // frames_per_chunk
+                for curr in range(history_chunk_index, current_chunk_index + 1):
+                    for j in range(frames_per_chunk):
+                        base_index = curr * frames_per_chunk
+                        if base_index + j < 0 or base_index + j >= num_frames:
+                            continue
+                        mask[i, base_index + j] = 1
+            return mask
+
+        @tf.function(autograph=True)
+        def _calculate_mask_tf(num_frames, frames_per_chunk, history_window_size):
+            chunk_ids = tf.range(num_frames) // frames_per_chunk
+            num_chunks = tf.cast(tf.math.ceil(num_frames / frames_per_chunk), dtype=tf.int32)
+
+            # Create first `frames_per_chunk` rows
+            current = tf.ones((frames_per_chunk), dtype=tf.int32)
+            trailing = tf.ones(((num_chunks - 1) * frames_per_chunk), dtype=tf.int32)
+            tmp_row = tf.concat((current, trailing), axis=0)
+            row = tf.slice(tmp_row, [0], [num_frames])
+            mask = tf.expand_dims(row, axis=0)
+
+            for i in range(1, frames_per_chunk):
+                mask = tf.concat((mask, [row]), axis=0)
+
+            # Create the following rows
+            for i in range(frames_per_chunk, num_frames):
+                tf.autograph.experimental.set_loop_options(
+                    shape_invariants=[(mask, tf.TensorShape([None, None]))]
+                )
+                curr_chunk_id = chunk_ids[i]
+                hist_i = tf.math.maximum(i - history_window_size, 0)
+                hist_chunk_id = chunk_ids[hist_i]
+
+                # Build the left-most part
+                leading_chunk_id = hist_chunk_id - 1
+                num_leading_chunks = tf.math.maximum(leading_chunk_id + 1, 0)
+                leftmost_row = tf.zeros((num_leading_chunks * frames_per_chunk), dtype=tf.int32)
+
+                # Build the current visible chunks
+                num_hist_chunks = curr_chunk_id - hist_chunk_id
+                num_visible_chunks = num_hist_chunks + 1
+                curr_chunk_row = tf.ones((num_visible_chunks * frames_per_chunk), dtype=tf.int32)
+
+                # Build the trailing 0s
+                num_trailing_chunks = tf.math.maximum((num_chunks - curr_chunk_id) - 1, 0)
+                trailing_chunk_row = tf.zeros((num_trailing_chunks * frames_per_chunk), dtype=tf.int32)
+
+                # Merge chunks, clip to output size
+                tmp_row = tf.concat([leftmost_row, curr_chunk_row, trailing_chunk_row], axis=0)
+                row = tf.slice(tmp_row, [0], [num_frames])
+
+                mask = tf.concat((mask, [row]), axis=0)
+            return mask
+
+        if self.use_tf:
+            mask = _calculate_mask_tf(num_frames, frames_per_chunk, self.history_window_size)
+        else:
+            mask = tf.numpy_function(
+                _calculate_mask, inp=[num_frames, frames_per_chunk, self.history_window_size], Tout=tf.int32
+            )
+            mask.set_shape((None, None))
+
+        return mask
+
+    def calculate_mask(self, num_frames):
+        num_frames = math_util.get_reduced_length(num_frames, self.time_reduction_factor)
+
+        if self.use_base_mask:
+            return tf.slice(self.base_mask, [0, 0], [num_frames, num_frames])
+        return self._recalculate_mask(num_frames)
+
+    def preprocess(self, path: tf.Tensor, audio: tf.Tensor, indices: tf.Tensor):
+        preprocessed_inputs = super(ASRMaskedSliceDataset, self).preprocess(path, audio, indices)
+
+        input_length = preprocessed_inputs[2]
+        mask = self.calculate_mask(input_length)
+
+        return (*preprocessed_inputs, mask)
+
+    def tf_preprocess(self, path: tf.Tensor, audio: tf.Tensor, indices: tf.Tensor):
+        preprocessed_inputs = super(ASRMaskedSliceDataset, self).tf_preprocess(path, audio, indices)
+
+        input_length = preprocessed_inputs[2]
+        mask = self.calculate_mask(input_length)
+
+        return (*preprocessed_inputs, mask)
+
+    # -------------------------------- CREATION -------------------------------------
+
+    def parse(self, path: tf.Tensor, audio: tf.Tensor, indices: tf.Tensor):
+        """
+        Returns:
+            path, features, input_lengths, labels, label_lengths, pred_inp, mask
+        """
+        if self.use_tf: data = self.tf_preprocess(path, audio, indices)
+        else: data = self.preprocess(path, audio, indices)
+
+        _, features, input_length, label, label_length, prediction, prediction_length, mask = data
+
+        return (
+            data_util.create_inputs(
+                inputs=features,
+                inputs_length=input_length,
+                predictions=prediction,
+                predictions_length=prediction_length,
+                mask=mask
+            ),
+            data_util.create_labels(
+                labels=label,
+                labels_length=label_length
+            )
+        )
+
+    def process(self, dataset: tf.data.Dataset, batch_size: int):
+        dataset = dataset.map(self.parse, num_parallel_calls=AUTOTUNE)
+        self.total_steps = math_util.get_num_batches(self.total_steps, batch_size, drop_remainders=self.drop_remainder)
+
+        if self.cache:
+            dataset = dataset.cache()
+
+        if self.shuffle:
+            dataset = dataset.shuffle(self.buffer_size, reshuffle_each_iteration=True)
+
+        if self.indefinite and self.total_steps:
+            dataset = dataset.repeat()
+
+        # PADDED BATCH the dataset
+        dataset = dataset.padded_batch(
+            batch_size=batch_size,
+            padded_shapes=(
+                data_util.create_inputs(
+                    inputs=tf.TensorShape(self.speech_featurizer.shape),
+                    inputs_length=tf.TensorShape([]),
+                    predictions=tf.TensorShape(self.text_featurizer.prepand_shape),
+                    predictions_length=tf.TensorShape([]),
+                    mask=tf.TensorShape([self.speech_featurizer.shape[0], self.speech_featurizer.shape[0]])
+                ),
+                data_util.create_labels(
+                    labels=tf.TensorShape(self.text_featurizer.shape),
+                    labels_length=tf.TensorShape([])
+                ),
+            ),
+            padding_values=(
+                data_util.create_inputs(
+                    inputs= 0.,
+                    inputs_length=0,
+                    predictions=self.text_featurizer.blank,
+                    predictions_length=0,
+                    mask=0
+                ),
+                data_util.create_labels(
+                    labels=self.text_featurizer.blank,
+                    labels_length=0
+                )
+            ),
+            drop_remainder = self.drop_remainder
+        )
+
+        # PREFETCH to improve speed of input length
+        dataset = dataset.prefetch(AUTOTUNE)
+        return dataset
+
+    def create(self, batch_size: int):
+        self.read_entries()
+        if not self.total_steps or self.total_steps == 0: return None
+        dataset = tf.data.Dataset.from_generator(
+            self.generator,
+            output_types=(tf.string, tf.string, tf.string),
+            output_shapes=(tf.TensorShape([]), tf.TensorShape([]), tf.TensorShape([]))
+        )
+        return self.process(dataset, batch_size)
+
+
+class ASRMaskedTFRecordDataset(ASRMaskedSliceDataset, ASRTFRecordDataset):
+    """ Dataset for ASR using TFRecords with rolling mask """
+    def __init__(self,
+                 data_paths: list,
+                 tfrecords_dir: str,
+                 speech_featurizer: SpeechFeaturizer,
+                 text_featurizer: TextFeaturizer,
+                 stage: str,
+                 augmentations: Augmentation = Augmentation(None),
+                 tfrecords_shards: int = TFRECORD_SHARDS,
+                 cache: bool = False,
+                 shuffle: bool = False,
+                 use_tf: bool = False,
+                 indefinite: bool = False,
+                 drop_remainder: bool = True,
+                 buffer_size: int = BUFFER_SIZE,
+                 history_window_size: int = 3,
+                 input_chunk_duration: int = 250,
+                 time_reduction_factor: int = 4,
+                 **kwargs):
+        super(ASRMaskedTFRecordDataset, self).__init__(
+            stage=stage, speech_featurizer=speech_featurizer, text_featurizer=text_featurizer,
+            data_paths=data_paths, augmentations=augmentations, cache=cache, shuffle=shuffle, buffer_size=buffer_size,
+            drop_remainder=drop_remainder, use_tf=use_tf, indefinite=indefinite, history_window_size = history_window_size,
+            input_chunk_duration = input_chunk_duration, time_reduction_factor = time_reduction_factor,
+        )
+        if not self.stage: raise ValueError("stage must be defined, either 'train', 'eval' or 'test'")
+        self.tfrecords_dir = tfrecords_dir
+        if tfrecords_shards <= 0: raise ValueError("tfrecords_shards must be positive")
+        self.tfrecords_shards = tfrecords_shards
+        if not tf.io.gfile.exists(self.tfrecords_dir): tf.io.gfile.makedirs(self.tfrecords_dir)
+
+    def parse(self, record: tf.Tensor):
+        feature_description = {
+            "path": tf.io.FixedLenFeature([], tf.string),
+            "audio": tf.io.FixedLenFeature([], tf.string),
+            "indices": tf.io.FixedLenFeature([], tf.string)
+        }
+        example = tf.io.parse_single_example(record, feature_description)
+        if self.use_tf: data = self.tf_preprocess(**example)
+        else: data = self.preprocess(**example)
+
+        _, features, input_length, label, label_length, prediction, prediction_length, mask = data
+
+        return (
+            data_util.create_inputs(
+                inputs=features,
+                inputs_length=input_length,
+                predictions=prediction,
+                predictions_length=prediction_length,
+                mask=mask
+            ),
+            data_util.create_labels(
+                labels=label,
+                labels_length=label_length
+            )
+        )
